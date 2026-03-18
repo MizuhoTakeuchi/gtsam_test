@@ -13,6 +13,7 @@ def generate_launch_description():
                 'optimization_period_ms': 500,
                 'between_noise_translation': 1.0,
                 'between_noise_rotation': 0.1,
+                'min_dt_for_new_node': 0.001,
             }],
             remappings=[
                 ('/gps/pose_with_covariance', '/gps/pose_with_covariance'),

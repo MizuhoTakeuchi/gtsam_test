@@ -1,5 +1,6 @@
 // GTSAM-based pose estimator fusing GPS and LiDAR measurements
-// Optimization runs at 500ms cycle using ISAM2 incremental solver
+// Event-driven node creation: each sensor measurement timestamp gets its own pose node
+// BetweenFactor noise scales with sqrt(dt) (random walk model)
 
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
@@ -17,6 +18,7 @@
 #include <gtsam/nonlinear/Values.h>
 #include <gtsam/inference/Symbol.h>
 
+#include <algorithm>
 #include <mutex>
 #include <vector>
 
@@ -86,6 +88,17 @@ static geometry_msgs::msg::PoseStamped gtsamPoseToRos(
 }
 
 // ---------------------------------------------------------------------------
+// Stamped measurement: unified representation for GPS and LiDAR
+// ---------------------------------------------------------------------------
+
+struct StampedMeasurement {
+  rclcpp::Time stamp;
+  enum class Source { GPS, LIDAR } source;
+  gtsam::Pose3 pose;
+  gtsam::SharedNoiseModel noise;
+};
+
+// ---------------------------------------------------------------------------
 // Node
 // ---------------------------------------------------------------------------
 
@@ -102,6 +115,8 @@ public:
         this->declare_parameter("between_noise_translation", 1.0);
     between_noise_rot_ =
         this->declare_parameter("between_noise_rotation", 0.1);
+    min_dt_for_new_node_ =
+        this->declare_parameter("min_dt_for_new_node", 0.001);
 
     // ISAM2
     gtsam::ISAM2Params params;
@@ -144,12 +159,13 @@ public:
         std::bind(&PoseEstimatorNode::optimizationCallback, this));
 
     RCLCPP_INFO(this->get_logger(),
-                "PoseEstimator started (period=%dms)", period_ms);
+                "PoseEstimator started (period=%dms, min_dt=%.4fs)",
+                period_ms, min_dt_for_new_node_);
   }
 
 private:
   // -------------------------------------------------------
-  // Core optimization routine (called every 500ms)
+  // Core optimization routine (called periodically)
   // -------------------------------------------------------
   void optimizationCallback()
   {
@@ -166,93 +182,146 @@ private:
       return;  // Nothing to do
     }
 
+    // ---- Convert all measurements to StampedMeasurement, sort by time ----
+    std::vector<StampedMeasurement> measurements;
+    measurements.reserve(gps_meas.size() + lidar_meas.size());
+
+    for (const auto & m : gps_meas) {
+      measurements.push_back({
+        m.header.stamp,
+        StampedMeasurement::Source::GPS,
+        rosPoseToGtsam(m.pose.pose),
+        rosCovarianceToGtsamNoise(m.pose.covariance)
+      });
+    }
+    for (const auto & m : lidar_meas) {
+      measurements.push_back({
+        m.header.stamp,
+        StampedMeasurement::Source::LIDAR,
+        rosPoseToGtsam(m.pose.pose),
+        rosCovarianceToGtsamNoise(m.pose.covariance)
+      });
+    }
+
+    std::sort(measurements.begin(), measurements.end(),
+        [](const StampedMeasurement & a, const StampedMeasurement & b) {
+          return a.stamp < b.stamp;
+        });
+
+    // ---- Build factor graph incrementally ----
     gtsam::NonlinearFactorGraph new_factors;
     gtsam::Values new_values;
-    const gtsam::Key current_key = X(pose_index_);
 
-    // ------- Compute initial estimate for the new pose -------
-    // Use the average of available measurements as initial guess
-    gtsam::Pose3 initial_estimate;
-    if (!lidar_meas.empty()) {
-      initial_estimate = rosPoseToGtsam(lidar_meas.back().pose.pose);
-    } else if (!gps_meas.empty()) {
-      initial_estimate = rosPoseToGtsam(gps_meas.back().pose.pose);
-    } else if (pose_index_ > 0) {
-      initial_estimate = latest_pose_;
+    // Previous node's initial estimate (for BetweenFactor delta computation)
+    gtsam::Pose3 prev_estimate = latest_pose_;
+
+    // The key we attach measurement PriorFactors to
+    gtsam::Key attach_key;
+    bool have_node = (pose_index_ > 0);
+    if (have_node) {
+      attach_key = X(pose_index_ - 1);
     }
 
-    // ------- First pose: add a prior -------
-    if (pose_index_ == 0) {
-      // Use the first available measurement's covariance as prior noise
-      gtsam::SharedNoiseModel prior_noise;
-      if (!lidar_meas.empty()) {
-        prior_noise =
-            rosCovarianceToGtsamNoise(lidar_meas.front().pose.covariance);
+    // Track new nodes for path publishing
+    struct NewNode { gtsam::Key key; rclcpp::Time stamp; };
+    std::vector<NewNode> new_nodes;
+    rclcpp::Time latest_stamp;
+    size_t gps_count = 0;
+    size_t lidar_count = 0;
+
+    for (const auto & meas : measurements) {
+      bool need_new_node = false;
+
+      if (!have_node) {
+        // No node exists yet — must create the first one
+        need_new_node = true;
       } else {
-        prior_noise =
-            rosCovarianceToGtsamNoise(gps_meas.front().pose.covariance);
+        double dt = (meas.stamp - prev_stamp_).seconds();
+        if (dt < 0.0) {
+          RCLCPP_WARN(this->get_logger(),
+              "Timestamp went backwards (dt=%.4fs), skipping measurement", dt);
+          continue;
+        }
+        if (dt >= min_dt_for_new_node_) {
+          need_new_node = true;
+        }
       }
-      new_factors.addPrior(current_key, initial_estimate, prior_noise);
+
+      if (need_new_node) {
+        gtsam::Key new_key = X(pose_index_);
+        new_values.insert(new_key, meas.pose);
+
+        if (!have_node) {
+          // First node ever: anchor prior
+          new_factors.addPrior(new_key, meas.pose, meas.noise);
+        } else {
+          // BetweenFactor with sqrt(dt)-scaled noise (random walk model)
+          double dt = (meas.stamp - prev_stamp_).seconds();
+          double dt_sqrt = std::sqrt(std::max(dt, 1e-6));
+          auto between_noise = gtsam::noiseModel::Diagonal::Sigmas(
+              (gtsam::Vector(6) <<
+                  between_noise_rot_ * dt_sqrt,
+                  between_noise_rot_ * dt_sqrt,
+                  between_noise_rot_ * dt_sqrt,
+                  between_noise_trans_ * dt_sqrt,
+                  between_noise_trans_ * dt_sqrt,
+                  between_noise_trans_ * dt_sqrt
+              ).finished());
+
+          gtsam::Pose3 delta = prev_estimate.between(meas.pose);
+          new_factors.emplace_shared<gtsam::BetweenFactor<gtsam::Pose3>>(
+              attach_key, new_key, delta, between_noise);
+        }
+
+        attach_key = new_key;
+        have_node = true;
+        prev_stamp_ = meas.stamp;
+        prev_estimate = meas.pose;
+        new_nodes.push_back({new_key, meas.stamp});
+        ++pose_index_;
+      }
+
+      // Measurement PriorFactor on the current node
+      new_factors.addPrior(attach_key, meas.pose, meas.noise);
+      latest_stamp = meas.stamp;
+
+      if (meas.source == StampedMeasurement::Source::GPS) {
+        ++gps_count;
+      } else {
+        ++lidar_count;
+      }
     }
 
-    // ------- BetweenFactor from previous pose -------
-    if (pose_index_ > 0) {
-      // Constant-pose motion model (identity transform with tunable noise)
-      auto between_noise = gtsam::noiseModel::Diagonal::Sigmas(
-          (gtsam::Vector(6) <<
-              between_noise_rot_, between_noise_rot_, between_noise_rot_,
-              between_noise_trans_, between_noise_trans_, between_noise_trans_
-          ).finished());
-
-      // Use delta from latest_pose to initial_estimate as between measurement
-      gtsam::Pose3 delta = latest_pose_.between(initial_estimate);
-      new_factors.emplace_shared<gtsam::BetweenFactor<gtsam::Pose3>>(
-          X(pose_index_ - 1), current_key, delta, between_noise);
+    // All measurements may have been skipped (backward timestamps)
+    if (new_factors.empty()) {
+      return;
     }
 
-    // ------- GPS measurement factors (PriorFactor on this pose) -------
-    for (const auto & m : gps_meas) {
-      gtsam::Pose3 measured = rosPoseToGtsam(m.pose.pose);
-      gtsam::SharedNoiseModel noise =
-          rosCovarianceToGtsamNoise(m.pose.covariance);
-      new_factors.addPrior(current_key, measured, noise);
-    }
-
-    // ------- LiDAR measurement factors (PriorFactor on this pose) -------
-    for (const auto & m : lidar_meas) {
-      gtsam::Pose3 measured = rosPoseToGtsam(m.pose.pose);
-      gtsam::SharedNoiseModel noise =
-          rosCovarianceToGtsamNoise(m.pose.covariance);
-      new_factors.addPrior(current_key, measured, noise);
-    }
-
-    // ------- Insert initial value & run ISAM2 update -------
-    new_values.insert(current_key, initial_estimate);
+    // ---- Run ISAM2 update (single batch) ----
     isam2_->update(new_factors, new_values);
+    isam2_->update();  // extra iteration for convergence
 
-    // (Optional) run additional ISAM2 iterations for convergence
-    isam2_->update();
-
-    // ------- Extract result -------
+    // ---- Extract result ----
     gtsam::Values result = isam2_->calculateEstimate();
-    latest_pose_ = result.at<gtsam::Pose3>(current_key);
+    latest_pose_ = result.at<gtsam::Pose3>(attach_key);
 
-    // ------- Publish -------
-    rclcpp::Time now = this->now();
-
-    // PoseStamped
-    auto pose_msg = gtsamPoseToRos(latest_pose_, now, "map");
+    // ---- Publish ----
+    // Use measurement timestamp (not wall clock)
+    auto pose_msg = gtsamPoseToRos(latest_pose_, latest_stamp, "map");
     pose_pub_->publish(pose_msg);
 
-    // Path (append)
-    path_.header.stamp = now;
+    // Path: append all newly created nodes
+    for (const auto & node : new_nodes) {
+      gtsam::Pose3 p = result.at<gtsam::Pose3>(node.key);
+      path_.poses.push_back(gtsamPoseToRos(p, node.stamp, "map"));
+    }
+    path_.header.stamp = latest_stamp;
     path_.header.frame_id = "map";
-    path_.poses.push_back(pose_msg);
     path_pub_->publish(path_);
 
     // TF: map -> base_link
     geometry_msgs::msg::TransformStamped tf;
-    tf.header.stamp = now;
+    tf.header.stamp = latest_stamp;
     tf.header.frame_id = "map";
     tf.child_frame_id = "base_link";
     tf.transform.translation.x = pose_msg.pose.position.x;
@@ -262,15 +331,13 @@ private:
     tf_broadcaster_->sendTransform(tf);
 
     RCLCPP_INFO(this->get_logger(),
-                "[%zu] Optimized pose: (%.2f, %.2f, %.2f)  "
-                "GPS=%zu LiDAR=%zu factors",
+                "[total_nodes=%zu] Optimized pose: (%.2f, %.2f, %.2f)  "
+                "GPS=%zu LiDAR=%zu new_nodes=%zu",
                 pose_index_,
                 latest_pose_.translation().x(),
                 latest_pose_.translation().y(),
                 latest_pose_.translation().z(),
-                gps_meas.size(), lidar_meas.size());
-
-    ++pose_index_;
+                gps_count, lidar_count, new_nodes.size());
   }
 
   // -------------------------------------------------------
@@ -286,10 +353,12 @@ private:
   std::unique_ptr<gtsam::ISAM2> isam2_;
   size_t pose_index_ = 0;
   gtsam::Pose3 latest_pose_;
+  rclcpp::Time prev_stamp_;  // timestamp of the most recently created node
 
   // Parameters
-  double between_noise_trans_ = 1.0;
-  double between_noise_rot_ = 0.1;
+  double between_noise_trans_ = 1.0;   // noise density (sigma per sqrt-second)
+  double between_noise_rot_ = 0.1;     // noise density (sigma per sqrt-second)
+  double min_dt_for_new_node_ = 0.001; // minimum dt (seconds) to create a new node
 
   // ROS interfaces
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr
